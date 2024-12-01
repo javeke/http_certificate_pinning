@@ -3,9 +3,99 @@ import UIKit
 import CryptoSwift
 import Alamofire
 
-public class SwiftHttpCertificatePinningPlugin: NSObject, FlutterPlugin {
+class ResultDispatchedWrapper {
+    var value: Bool
+    
+    init(value: Bool) {
+        self.value = value
+    }
+}
 
-    let manager = Alamofire.SessionManager.default
+class SHA256TrustEvaluator: ServerTrustEvaluating {
+    private let validFingerprints: Array<String>?
+    private let expectedHost: String
+    private let flutterResult: FlutterResult
+    private let type: String
+    private var resultDispatched: ResultDispatchedWrapper
+    
+
+    init(validFingerprints: [String], expectedHost: String, flutterResult: @escaping FlutterResult, type: String, resultDispatched: ResultDispatchedWrapper) {
+        self.validFingerprints = validFingerprints
+        self.expectedHost = expectedHost
+        self.flutterResult = flutterResult
+        self.type = type
+        self.resultDispatched = resultDispatched
+    }
+
+    func evaluate(_ trust: SecTrust, forHost host: String) throws {
+        guard host == expectedHost else {
+            flutterResult(
+                FlutterError(
+                    code: "ERROR CERT",
+                    message: "Invalid Host",
+                    details: nil
+                )
+            )
+            throw AFError.serverTrustEvaluationFailed(reason: .trustEvaluationFailed(error: nil))
+        }
+        
+        guard let serverCertificate = SecTrustGetCertificateAtIndex(trust, 0) else {
+            flutterResult(
+                FlutterError(
+                    code: "ERROR CERT",
+                    message: "Invalid Certificate",
+                    details: nil
+                )
+            )
+            throw AFError.serverTrustEvaluationFailed(reason: .noCertificatesFound)
+        }
+        
+        let serverCertificateData = SecCertificateCopyData(serverCertificate) as Data
+        
+        
+        var serverFingerprint = sha256(data: serverCertificateData)
+        if(type == "SHA1"){
+            serverFingerprint = serverCertificateData.sha1().toHexString()
+        }
+        
+        
+        var result: SecTrustResultType = .invalid
+        SecTrustEvaluate(trust, &result)
+        let isServerTrusted: Bool = (result == .unspecified || result == .proceed)
+
+        var isSecure = false
+        if var fp = self.validFingerprints {
+            fp = fp.compactMap { (val) -> String? in
+                val.replacingOccurrences(of: " ", with: "")
+        }
+
+            isSecure = fp.contains(where: { (value) -> Bool in
+                value.caseInsensitiveCompare(serverFingerprint) == .orderedSame
+            })
+        }
+        
+        if isServerTrusted && isSecure {
+            flutterResult("CONNECTION_SECURE")
+            resultDispatched.value = true
+        } else {
+            flutterResult(
+                FlutterError(
+                    code: "CONNECTION_NOT_SECURE",
+                    message: nil,
+                    details: nil
+                )
+            )
+            resultDispatched.value = true
+        }
+    }
+
+    private func sha256(data: Data) -> String {
+        return data.sha256().toHexString()
+    }
+}
+
+
+public class SwiftHttpCertificatePinningPlugin: NSObject, FlutterPlugin {
     var fingerprints: Array<String>?
     var flutterResult: FlutterResult?
 
@@ -32,6 +122,13 @@ public class SwiftHttpCertificatePinningPlugin: NSObject, FlutterPlugin {
         default:
             result(FlutterMethodNotImplemented)
         }
+    }
+    
+    func getDomain(from urlString: String) -> String? {
+        if let url = URL(string: urlString) {
+            return url.host
+        }
+        return nil
     }
 
     public func check(
@@ -61,91 +158,48 @@ public class SwiftHttpCertificatePinningPlugin: NSObject, FlutterPlugin {
             timeout = timeoutArg
         }
         
-        let manager = Alamofire.SessionManager(
-            configuration: URLSessionConfiguration.default
-        )
+        let resultDispatched = ResultDispatchedWrapper(value: false)
         
-        var resultDispatched = false;
+        let host : String = getDomain(from: urlString) ?? ""
+        
+        let configuration = URLSessionConfiguration.default
+        
+        // Evaluate certificates each time
+        //configuration.httpShouldUsePipelining = false
+        //configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        
+        let manager = Session(
+            configuration: configuration,
+            serverTrustManager: ServerTrustManager(evaluators: [host:SHA256TrustEvaluator(validFingerprints: fingerprints, expectedHost: host, flutterResult: flutterResult, type: type, resultDispatched: resultDispatched)])
+        )
         
         manager.session.configuration.timeoutIntervalForRequest = TimeInterval(timeout)
         
-        manager.request(urlString, method: .get, parameters: headers).validate().responseJSON() { response in
+        manager.request(urlString, method: .get, parameters: headers).validate().response() { response in
             switch response.result {
                 case .success:
                     break
             case .failure(let error):
-                if (!resultDispatched) {
+                if (!resultDispatched.value) {
                     flutterResult(
                         FlutterError(
                             code: "URL Format",
                             message: error.localizedDescription,
-                            details: nil
+                            details: error.failureReason
                         )
                     )
+                    resultDispatched.value = true
                }
                    
                 break
             }
             
+            //if (!resultDispatched.value) {
+            //    flutterResult("CONNECTION STATUS UNKNOWN")
+            //}
+            
             // To retain
             let _ = manager
-        }
-
-        manager.delegate.sessionDidReceiveChallenge = { session, challenge in
-            guard let serverTrust = challenge.protectionSpace.serverTrust, let certificate = SecTrustGetCertificateAtIndex(serverTrust, 0) else {
-                flutterResult(
-                    FlutterError(
-                        code: "ERROR CERT",
-                        message: "Invalid Certificate",
-                        details: nil
-                    )
-                )
-                
-                return (.cancelAuthenticationChallenge, nil)
-            }
-
-            // Set SSL policies for domain name check
-            let policies: [SecPolicy] = [SecPolicyCreateSSL(true, (challenge.protectionSpace.host as CFString))]
-            SecTrustSetPolicies(serverTrust, policies as CFTypeRef)
-
-            // Evaluate server certificate
-            var result: SecTrustResultType = .invalid
-            SecTrustEvaluate(serverTrust, &result)
-            let isServerTrusted: Bool = (result == .unspecified || result == .proceed)
-
-            let serverCertData = SecCertificateCopyData(certificate) as Data
-            var serverCertSha = serverCertData.sha256().toHexString()
-
-            if(type == "SHA1"){
-                serverCertSha = serverCertData.sha1().toHexString()
-            }
-
-            var isSecure = false
-            if var fp = self.fingerprints {
-                fp = fp.compactMap { (val) -> String? in
-                    val.replacingOccurrences(of: " ", with: "")
-            }
-
-                isSecure = fp.contains(where: { (value) -> Bool in
-                    value.caseInsensitiveCompare(serverCertSha) == .orderedSame
-                })
-            }
-
-            if isServerTrusted && isSecure {
-                flutterResult("CONNECTION_SECURE")
-                resultDispatched = true
-            } else {
-                flutterResult(
-                    FlutterError(
-                        code: "CONNECTION_NOT_SECURE",
-                        message: nil,
-                        details: nil
-                    )
-                )
-                resultDispatched = true
-            }
-
-            return (.cancelAuthenticationChallenge, nil)
         }
     }
 }

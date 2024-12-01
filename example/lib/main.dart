@@ -182,7 +182,7 @@ class _MyAppState extends State<MyApp> {
                         child: const Text(
                           'Check',
                           style: TextStyle(
-                            color: Colors.white,
+                            color: Colors.black,
                           ),
                         ),
                       ),
