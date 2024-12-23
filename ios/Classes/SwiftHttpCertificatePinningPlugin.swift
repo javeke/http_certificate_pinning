@@ -165,8 +165,8 @@ public class SwiftHttpCertificatePinningPlugin: NSObject, FlutterPlugin {
         let configuration = URLSessionConfiguration.default
         
         // Evaluate certificates each time
-        //configuration.httpShouldUsePipelining = false
-        //configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.httpShouldUsePipelining = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         
         let manager = Session(
             configuration: configuration,
